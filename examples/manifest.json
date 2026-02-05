@@ -1,0 +1,8 @@
+{
+  "skill_name": "example-skill",
+  "version": "1.0",
+  "category": "utility",
+  "description": "An example skill for the Lattice Protocol.",
+  "last_updated": "2026-02-06T00:00:00Z",
+  "history": []
+}

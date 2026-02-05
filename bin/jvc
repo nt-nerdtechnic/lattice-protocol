@@ -1,0 +1,220 @@
+#!/bin/bash
+# JVC (JSON Version Control) v1.0.0 - The Engine of Lattice Protocol
+# Open Source Release for Agentic AI Collaboration
+# 
+# Description:
+#   A lightweight, JSON-native, atomic version control system designed for AI agents.
+#   It uses a distributed manifest architecture and OS-level atomic locking 
+#   to ensure safe, highly scalable multi-agent synchronization.
+#
+# Usage:
+#   jvc fetch                - Rebuild local index from Cloud Master
+#   jvc pull                 - Sync skills from Cloud Master (partial/full)
+#   jvc push <skill> <msg>   - Atomically push changes with auto-versioning
+#   jvc status               - Check synchronization status
+#
+# Configuration (Environment Variables):
+#   JVC_WORKSPACE_ROOT  - Path to your local workspace (Default: $HOME/ai_workspace)
+#   JVC_MASTER_REPO     - Path to the shared Cloud Master (Default: $HOME/lattice_master)
+
+# --- Configuration ---
+WORKSPACE_ROOT="${JVC_WORKSPACE_ROOT:-$HOME/ai_workspace}"
+LOCAL_REPO="$WORKSPACE_ROOT/skills"
+LOCAL_REGISTRY="$LOCAL_REPO/jvc_registry.json"
+CACHE_FILE="$LOCAL_REPO/jvc_cloud_map.json"
+
+# Default Master Path (can be a mounted network drive or cloud synced folder)
+DEFAULT_MASTER_REPO="${JVC_MASTER_REPO:-$HOME/lattice_master}"
+MASTER_REPO=${MASTER_REPO:-$DEFAULT_MASTER_REPO}
+
+# --- Ignore List (AI-Native Optimization) ---
+# Files that should NOT be synced to local agent brain to save token/storage
+SYNC_IGNORE=("COMMIT_HISTORY.md" "*.log" ".DS_Store" "manifest.json" ".lock" "snapshots")
+EXCLUDE_ARGS=""
+for item in "${SYNC_IGNORE[@]}"; do EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude='$item'"; done
+
+# --- Helper Functions ---
+
+usage() {
+    echo "========================================================"
+    echo "   Lattice Protocol | Engine: JVC (JSON Version Control)  "
+    echo "========================================================"
+    echo ""
+    echo "Usage: jvc <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  fetch                - Scan Cloud Master to rebuild distributed index"
+    echo "  pull                 - Sync subscribed skills from Lattice Master"
+    echo "  push <skill> <msg>   - Atomically push changes (Lock -> Snapshot -> Sync)"
+    echo "  history <skill>      - Read commit history from Cloud Master"
+    echo "  status               - Check sync status against Master"
+    echo ""
+    echo "Environment:"
+    echo "  Workspace: $WORKSPACE_ROOT"
+    echo "  Master:    $MASTER_REPO"
+    echo ""
+    exit 1
+}
+
+ensure_deps() {
+    if ! command -v jq &> /dev/null; then
+        echo "Error: 'jq' is required but not found. Please install jq."
+        exit 1
+    fi
+    mkdir -p "$LOCAL_REPO"
+}
+
+fetch_master() {
+    echo "🔄 JVC Fetch: Scanning Lattice Master nodes..."
+    echo "{ \"skills\": {} }" > "$CACHE_FILE"
+    
+    if [ ! -d "$MASTER_REPO" ]; then
+        echo "⚠️  Warning: Master Repo not found at $MASTER_REPO"
+        return
+    fi
+    
+    # Recursively find manifest.json to build the map
+    manifests=$(find "$MASTER_REPO" -name "manifest.json")
+    count=0
+    for m in $manifests; do
+        skill_info=$(cat "$m")
+        # Safe extraction
+        name=$(echo "$skill_info" | jq -r ".skill_name // empty")
+        [ -z "$name" ] && continue
+        
+        full_dir=$(dirname "$m")
+        rel_path=${full_dir#$MASTER_REPO/}
+        
+        tmp=$(mktemp)
+        jq --arg name "$name" --arg path "$rel_path" --argjson info "$skill_info" \
+           ".skills[\$name] = \$info | .skills[\$name].cloud_path = \$path" "$CACHE_FILE" > "$tmp" && mv "$tmp" "$CACHE_FILE"
+        ((count++))
+    done
+    echo "✅ Fetch Complete: Discovered $count active Lattice nodes."
+}
+
+get_cloud_info() {
+    local s=$1
+    [ ! -f "$CACHE_FILE" ] && fetch_master > /dev/null
+    jq -r ".skills.\"$s\" // empty" "$CACHE_FILE"
+}
+
+# --- Core Logic ---
+
+pull_skill_logic() {
+    local s=$1
+    local cloud_info=$(get_cloud_info "$s")
+    
+    if [ -z "$cloud_info" ]; then
+        echo "⚠️  Skill [$s] not found in Lattice Master."
+        return
+    fi
+
+    local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
+    local m_ver=$(echo "$cloud_info" | jq -r ".version")
+    
+    echo "⬇️  Pulling [$s] v$m_ver..."
+    mkdir -p "$LOCAL_REPO/$s"
+    
+    # Rsync with exclusion (AI-Native: don't pull heavy history)
+    eval "rsync -av --delete $EXCLUDE_ARGS \"$MASTER_REPO/$cloud_path/\" \"$LOCAL_REPO/$s/\""
+    
+    # Update local registry
+    tmp=$(mktemp)
+    if [ ! -f "$LOCAL_REGISTRY" ]; then echo "{ \"skills\": {} }" > "$LOCAL_REGISTRY"; fi
+    jq ".skills.\"$s\".version = \"$m_ver\"" "$LOCAL_REGISTRY" > "$tmp" && mv "$tmp" "$LOCAL_REGISTRY"
+    echo "✅ [$s] Synced."
+}
+
+push_skill() {
+    local s=$1
+    local msg=$2
+    
+    if [ -z "$s" ] || [ -z "$msg" ]; then
+        echo "Usage: jvc push <skill_name> <commit_message>"
+        exit 1
+    fi
+
+    local cloud_info=$(get_cloud_info "$s")
+    if [ -z "$cloud_info" ]; then
+        echo "❌ Error: Skill [$s] not found in Master index. (Init not supported in v1.0)"
+        exit 1
+    fi
+
+    local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
+    local LOCK_DIR="$MASTER_REPO/$cloud_path/.lock"
+    
+    # 1. Atomic Locking
+    echo "🔒 Acquiring Lattice Lock for [$s]..."
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "🚨 Lock Failed: Resource is busy. Another agent is syncing."
+        exit 1
+    fi
+    
+    # Trap to ensure lock is released on exit/error
+    trap 'rm -rf "$LOCK_DIR"' EXIT
+
+    # 2. Version Calculation
+    local old_ver=$(echo "$cloud_info" | jq -r ".version")
+    local new_ver=$(echo "$old_ver" | awk "{print \$1 + 0.1}")
+    local now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+    
+    # 3. Snapshot (Rollback Safety)
+    mkdir -p "$MASTER_REPO/snapshots"
+    tar -czf "$MASTER_REPO/snapshots/${s}_v${old_ver}.tar.gz" -C "$MASTER_REPO" "$cloud_path" 2>/dev/null
+    
+    # 4. Sync Code
+    echo "🚀 Pushing v$new_ver to Lattice Master..."
+    rsync -av "$LOCAL_REPO/$s/" "$MASTER_REPO/$cloud_path/"
+    
+    # 5. Update Manifest & History (JSON Operations)
+    local hist_msg="[$now] v$new_ver - $msg"
+    local manifest="$MASTER_REPO/$cloud_path/manifest.json"
+    
+    if [ -f "$manifest" ]; then
+        tmp_m=$(mktemp)
+        jq ".version = \"$new_ver\" | .description = \"$msg\" | .last_updated = \"$now\" | .history = ([\"$hist_msg\"] + .history | .[0:10])" "$manifest" > "$tmp_m" && mv "$tmp_m" "$manifest"
+    fi
+    
+    echo "$hist_msg" >> "$MASTER_REPO/$cloud_path/COMMIT_HISTORY.md"
+    echo "✅ Push Complete."
+}
+
+# --- Main Dispatch ---
+
+ensure_deps
+
+case "$1" in
+    fetch) fetch_master ;;
+    pull)  
+        # In v1, pull syncs targets defined in local_registry.json
+        if [ -f "$LOCAL_REGISTRY" ]; then
+            TARGETS=$(jq -r '.sync_targets[]? // empty' "$LOCAL_REGISTRY")
+            for t in $TARGETS; do pull_skill_logic "$t"; done
+        else
+            echo "No sync targets found in $LOCAL_REGISTRY"
+        fi 
+        ;;
+    push)  push_skill "$2" "$3" ;;
+    history) 
+        info=$(get_cloud_info "$2")
+        [ -n "$info" ] && echo "$info" | jq -r '.history[]?' || echo "No history found."
+        ;;
+    status)
+        fetch_master > /dev/null
+        echo "--- JVC Status ---"
+        # Simple status check logic for subscribed skills
+        if [ -f "$LOCAL_REGISTRY" ]; then
+             TARGETS=$(jq -r '.sync_targets[]? // empty' "$LOCAL_REGISTRY")
+             for t in $TARGETS; do
+                c_info=$(get_cloud_info "$t")
+                if [ -n "$c_info" ]; then
+                    r_ver=$(echo "$c_info" | jq -r ".version")
+                    l_ver=$(jq -r ".skills.\"$t\".version // \"0.0\"" "$LOCAL_REGISTRY")
+                    echo "[$t]: Local v$l_ver | Remote v$r_ver"
+                fi
+             done
+        fi
+        ;;
+    *) usage ;;
+esac
