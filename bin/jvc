@@ -183,7 +183,12 @@ push_skill() {
     local LOCK_DIR="$MASTER_REPO/$cloud_path/.lock"
     
     echo "🔒 獲取 JVC [$s] 鎖..."
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then echo "🚨 鎖定失敗：該節點正被佔用。" && exit 1; fi
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        local lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+        echo "🚨 [LOCK_CONFLICT] 鎖定失敗：該節點正被佔用 (鎖定時間: ${lock_age}s)。"
+        echo "💡 [USER_ACTION_REQUIRED] 建議執行: rm -rf \"$LOCK_DIR\""
+        exit 42
+    fi
     
     trap 'rm -rf "$LOCK_DIR"' EXIT
 
