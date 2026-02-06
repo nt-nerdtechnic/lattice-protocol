@@ -1,0 +1,11 @@
+COMMIT_HISTORY.md
+*.log
+.DS_Store
+.SynologyWorkingDirectory
+manifest.json
+.lock
+local_registry.json
+config.json
+registry.json
+cloud_map_cache.json
+.jvcignore

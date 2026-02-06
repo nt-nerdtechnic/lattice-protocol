@@ -1,113 +1,225 @@
 #!/bin/bash
-# JVC (JSON Version Control) v3.3 - The Ecosystem Engine
-# Open Source Release for AI-Native Distributed Collaboration
-# 
-# Description:
-#   A JSON-native version control system featuring recursive dependency management.
-#   Designed for Agentic Swarms to synchronize skills and environment states atomically.
-#
-# Usage:
-#   jvc fetch                - Rebuild local index from Cloud Master
-#   jvc pull                 - Recursive sync (handles dependencies automatically)
-#   jvc push <skill> <msg>   - Atomic push with locking and snapshots
-#   jvc status               - Compare local vs master versions
-#   jvc history <skill>      - View JSON commit logs
+# JVC (JSON Version Control) - AI-Native Distributed Sync (v3.4 Ecosystem Version)
+# Created for NT AI Team by Marketing AI & Antigravity
 
-# --- Configuration ---
-WORKSPACE_ROOT="${JVC_WORKSPACE_ROOT:-$HOME/ai_workspace}"
+WORKSPACE_ROOT="$HOME/clawd"
 LOCAL_REPO="$WORKSPACE_ROOT/skills"
-LOCAL_REGISTRY="$LOCAL_REPO/jvc_registry.json"
-CACHE_FILE="$LOCAL_REPO/jvc_cloud_map.json"
+CONFIG_FILE="$LOCAL_REPO/skill-sync-manager/config.json"
+REGISTRY_FILE="$LOCAL_REPO/skill-sync-manager/registry.json"
+GLOBAL_IGNORE="$LOCAL_REPO/skill-sync-manager/.jvcignore"
 
-# --- Ignore List (AI-Native Optimization) ---
-SYNC_IGNORE=("COMMIT_HISTORY.md" "*.log" ".DS_Store" "manifest.json" ".lock" "snapshots")
-EXCLUDE_ARGS=""
-for item in "${SYNC_IGNORE[@]}"; do EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude='$item'"; done
+# 預設排除名單 (Hardcoded safety)
+DEFAULT_IGNORE=("COMMIT_HISTORY.md" "*.log" ".DS_Store" ".SynologyWorkingDirectory" "manifest.json" ".lock" "local_registry.json" "config.json" "registry.json" "cloud_map_cache.json" ".jvcignore")
 
-# Default Master
-MASTER_REPO="${JVC_MASTER_REPO:-$HOME/lattice_master}"
+# 取得排除參數的函式
+get_exclude_args() {
+    local s=$1
+    local args=""
+    
+    # 1. 預設排除
+    for item in "${DEFAULT_IGNORE[@]}"; do args="$args --exclude=$item"; done
+    
+    # 2. 全局 .jvcignore (位於 skill-sync-manager)
+    if [ -f "$GLOBAL_IGNORE" ]; then
+        args="$args --exclude-from=$GLOBAL_IGNORE"
+    fi
+    
+    # 3. 本地技能特定 .jvcignore
+    if [ -n "$s" ] && [ -f "$LOCAL_REPO/$s/.jvcignore" ]; then
+        args="$args --exclude-from=$LOCAL_REPO/$s/.jvcignore"
+    fi
+    
+    # 4. 根目錄 .jvcignore
+    if [ -f "$WORKSPACE_ROOT/.jvcignore" ]; then
+        args="$args --exclude-from=$WORKSPACE_ROOT/.jvcignore"
+    fi
+    
+    echo "$args"
+}
 
-# --- Helper Functions ---
+# 取得本地配置
+if [ -f "$CONFIG_FILE" ]; then
+    MASTER_REPO=$(jq -r '.master_repo_path // empty' "$CONFIG_FILE")
+    SYNC_TARGETS=$(jq -r '.sync_targets[]' "$CONFIG_FILE" 2>/dev/null | tr '\n' ' ')
+else
+    # 降級相容 (Migration Check)
+    OLD_REGISTRY="$LOCAL_REPO/skill-sync-manager/local_registry.json"
+    if [ -f "$OLD_REGISTRY" ]; then
+        MASTER_REPO=$(jq -r '.master_repo_path // empty' "$OLD_REGISTRY")
+        SYNC_TARGETS=$(jq -r '.sync_targets[]' "$OLD_REGISTRY" 2>/dev/null | tr '\n' ' ')
+    fi
+fi
+
+DEFAULT_MASTER_REPO="$HOME/NT_SKILL"
+MASTER_REPO=${MASTER_REPO:-$DEFAULT_MASTER_REPO}
+
+usage() {
+    echo "===================================================="
+    echo "       JVC (JSON Version Control) - v3.4            "
+    echo "===================================================="
+    echo ""
+    echo "Commands (AI-Native v3.4):"
+    echo "  fetch                - 掃描雲端 manifest 重建 JVC 地圖"
+    echo "  pull                 - 執行同步 (自動處理依賴關係)"
+    echo "  push <skill> <msg>   - 智慧推送 (Lock + Snapshot + Sync)"
+    echo "  history <skill>      - 直接讀取雲端 JVC 歷史紀錄"
+    echo "  status               - 比較本地與 JVC Master 差異"
+    echo "  tree                 - 生成本地 SKILL_TREE.md"
+    echo ""
+    echo "Environment Settings:"
+    echo "  Config: $CONFIG_FILE"
+    echo "  Registry: $REGISTRY_FILE"
+    echo "  Cloud Master: $MASTER_REPO"
+    exit 1
+}
 
 fetch_master() {
-    echo "🔄 JVC Fetch: Scanning Lattice nodes..."
-    echo "{ \"skills\": {} }" > "$CACHE_FILE"
-    [ ! -d "$MASTER_REPO" ] && echo "🚨 Master not found." && return 1
+    echo "🔄 JVC Fetch: 正在掃描雲端 manifest 節點..."
+    MAP_FILE="$LOCAL_REPO/skill-sync-manager/cloud_map_cache.json"
+    echo "{ \"skills\": {} }" > "$MAP_FILE"
+    
     manifests=$(find "$MASTER_REPO" -name "manifest.json")
     for m in $manifests; do
         skill_info=$(cat "$m")
-        name=$(echo "$skill_info" | jq -r ".skill_name // empty")
-        [ -z "$name" ] && continue
-        rel_path=$(dirname "$m"); rel_path=${rel_path#$MASTER_REPO/}
+        name=$(echo "$skill_info" | jq -r ".skill_name")
+        full_dir=$(dirname "$m")
+        rel_path=${full_dir#$MASTER_REPO/}
+        
         tmp=$(mktemp)
         jq --arg name "$name" --arg path "$rel_path" --argjson info "$skill_info" \
-           ".skills[\$name] = \$info | .skills[\$name].cloud_path = \$path" "$CACHE_FILE" > "$tmp" && mv "$tmp" "$CACHE_FILE"
+           ".skills[\$name] = \$info | .skills[\$name].cloud_path = \$path" "$MAP_FILE" > "$tmp" && mv "$tmp" "$MAP_FILE"
     done
-    echo "✅ Fetch Complete: $(jq '.skills | length' "$CACHE_FILE") nodes found."
+    echo "✅ Fetch 完成：偵測到 $(jq '.skills | length' "$MAP_FILE") 個有效節點。"
 }
 
 get_cloud_info() {
-    local s=$1; [ ! -f "$CACHE_FILE" ] && fetch_master > /dev/null
-    jq -r ".skills.\"$s\" // empty" "$CACHE_FILE"
+    local s=$1; local cache="$LOCAL_REPO/skill-sync-manager/cloud_map_cache.json"
+    [ ! -f "$cache" ] && fetch_master > /dev/null
+    jq -r ".skills.\"$s\" // empty" "$cache"
+}
+
+get_local_version() {
+    local s=$1
+    if [ -f "$REGISTRY_FILE" ]; then
+        jq -r ".skills.\"$s\".version // \"0.0\"" "$REGISTRY_FILE"
+    elif [ -f "$LOCAL_REPO/skill-sync-manager/local_registry.json" ]; then
+        jq -r ".skills.\"$s\".version // \"0.0\"" "$LOCAL_REPO/skill-sync-manager/local_registry.json"
+    else
+        echo "0.0"
+    fi
+}
+
+update_local_version() {
+    local s=$1; local ver=$2
+    [ ! -f "$REGISTRY_FILE" ] && echo "{ \"skills\": {} }" > "$REGISTRY_FILE"
+    tmp=$(mktemp)
+    jq ".skills.\"$s\".version = \"$ver\"" "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+check_skill_status() {
+    local s=$1; local cloud_info=$(get_cloud_info "$s")
+    if [ -z "$cloud_info" ]; then echo "❓ JVC 找不到技能: [$s]"; return; fi
+    
+    local m_ver=$(echo "$cloud_info" | jq -r ".version")
+    local l_ver=$(get_local_version "$s")
+    local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
+    local EXCLUDE_ARGS=$(get_exclude_args "$s")
+    
+    # 使用更加精確的 rsync 比對邏輯
+    local diff_check=$(rsync -ani $EXCLUDE_ARGS "$MASTER_REPO/$cloud_path/" "$LOCAL_REPO/$s/" 2>/dev/null | grep -E '^>f|^<f|^.f' | wc -l | xargs)
+    
+    if [[ "$l_ver" < "$m_ver" ]]; then echo "🔼 可更新：[$s] (v$l_ver -> v$m_ver)";
+    elif [ "$m_ver" == "$l_ver" ] && [ "$diff_check" -gt 0 ]; then echo "🚨 內容衝突：[$s]";
+    elif [[ "$l_ver" > "$m_ver" ]]; then echo "🆕 本地較新：[$s] (v$l_ver > v$m_ver)";
+    else echo "✅ 最新：[$s] (v$l_ver)"; fi
 }
 
 pull_skill_logic() {
     local s=$1; local cloud_info=$(get_cloud_info "$s")
     [ -z "$cloud_info" ] && return
-
-    # --- v3.3 Recursive Dependency Management ---
+    
+    # --- v3.3 依賴管理邏輯 ---
     local deps=$(echo "$cloud_info" | jq -r '.dependencies[]?' 2>/dev/null)
     for dep in $deps; do
-        echo "🔗 Dependency found: [$s] needs [$dep]"
+        echo "🔗 偵測到依賴：[$s] 需要 [$dep]"
         pull_skill_logic "$dep"
     done
 
     local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
     local m_ver=$(echo "$cloud_info" | jq -r ".version")
+    local l_ver=$(get_local_version "$s")
     
-    # Check local version to avoid redundant pull
-    local l_ver=$(jq -r ".skills.\"$s\".version // \"0.0\"" "$LOCAL_REGISTRY" 2>/dev/null)
-    [ "$l_ver" == "$m_ver" ] && [ -d "$LOCAL_REPO/$s" ] && return
+    # 檢查是否已經是最新，避免重複拉取
+    if [ "$l_ver" == "$m_ver" ] && [ -d "$LOCAL_REPO/$s" ]; then
+        return
+    fi
 
-    echo "  -> Syncing [$s] v$m_ver..."
+    echo "  -> 同步 JVC 節點 [$s] (v$m_ver)..."
     mkdir -p "$LOCAL_REPO/$s"
+    local EXCLUDE_ARGS=$(get_exclude_args "$s")
     eval "rsync -av --delete $EXCLUDE_ARGS \"$MASTER_REPO/$cloud_path/\" \"$LOCAL_REPO/$s/\""
     
-    tmp=$(mktemp); [ ! -f "$LOCAL_REGISTRY" ] && echo "{ \"skills\": {} }" > "$LOCAL_REGISTRY"
-    jq ".skills.\"$s\".version = \"$m_ver\"" "$LOCAL_REGISTRY" > "$tmp" && mv "$tmp" "$LOCAL_REGISTRY"
+    update_local_version "$s" "$m_ver"
 }
 
-# --- Main Logic ---
+pull_sync() {
+    [ -z "$SYNC_TARGETS" ] && echo "🚨 錯誤：尚未設定同步目標" && exit 1
+    echo "⏳ 正在啟動 JVC 同步 (處理依賴中)..."
+    for t in $SYNC_TARGETS; do
+        if [[ "$t" == cat:* ]]; then
+            cat_name=${t#cat:}; cache="$LOCAL_REPO/skill-sync-manager/cloud_map_cache.json"
+            SKILLS=$(jq -r ".skills | to_entries | .[] | select(.value.category == \"$cat_name\") | .key" "$cache")
+            for s in $SKILLS; do pull_skill_logic "$s"; done
+        else pull_skill_logic "$t"; fi
+    done
+    echo "✅ 同步作業完成。"
+}
+
+push_skill() {
+    local s=$1; local msg=$2; [ -z "$s" ] || [ -z "$msg" ] && echo "用法: push <skill> <msg>" && exit 1
+    local cloud_info=$(get_cloud_info "$s")
+    [ -z "$cloud_info" ] && echo "❌ 錯誤：JVC 找不到此技能" && exit 1
+    local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
+    local LOCK_DIR="$MASTER_REPO/$cloud_path/.lock"
+    
+    echo "🔒 獲取 JVC [$s] 鎖..."
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then echo "🚨 鎖定失敗：該節點正被佔用。" && exit 1; fi
+    
+    trap 'rm -rf "$LOCK_DIR"' EXIT
+
+    local old_ver=$(echo "$cloud_info" | jq -r ".version")
+    local new_ver=$(echo "$old_ver" | awk "{print \$1 + 0.1}")
+    local now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+    
+    mkdir -p "$MASTER_REPO/snapshots"
+    tar -czf "$MASTER_REPO/snapshots/${s}_v${old_ver}.tar.gz" -C "$MASTER_REPO" "$cloud_path" 2>/dev/null
+    
+    echo "🚀 推送 [$s] v$new_ver 到 JVC 雲端..."
+    [ -f "$LOCAL_REPO/$s/SKILL.md" ] && sed -i '' "s/version: .*/version: $new_ver/" "$LOCAL_REPO/$s/SKILL.md"
+    
+    local EXCLUDE_ARGS=$(get_exclude_args "$s")
+    eval "rsync -av $EXCLUDE_ARGS \"$LOCAL_REPO/$s/\" \"$MASTER_REPO/$cloud_path/\""
+    
+    local hist_msg="[$now] v$new_ver - $msg"; tmp_m=$(mktemp)
+    jq ".version = \"$new_ver\" | .description = \"$msg\" | .last_updated = \"$now\" | .history = ([\"$hist_msg\"] + .history | .[0:10])" "$MASTER_REPO/$cloud_path/manifest.json" > "$tmp_m" && mv "$tmp_m" "$MASTER_REPO/$cloud_path/manifest.json"
+    echo "$hist_msg" >> "$MASTER_REPO/$cloud_path/COMMIT_HISTORY.md"
+    
+    update_local_version "$s" "$new_ver"
+    echo "✅ JVC 推送完成！"
+}
 
 case "$1" in
     fetch) fetch_master ;;
-    pull)  
-        fetch_master > /dev/null
-        if [ -f "$LOCAL_REGISTRY" ]; then
-            TARGETS=$(jq -r '.sync_targets[]? // empty' "$LOCAL_REGISTRY")
-            for t in $TARGETS; do
-                if [[ "$t" == cat:* ]]; then
-                    cat_name=${t#cat:}
-                    for s in $(jq -r ".skills | to_entries | .[] | select(.value.category == \"$cat_name\") | .key" "$CACHE_FILE"); do pull_skill_logic "$s"; done
-                else pull_skill_logic "$t"; fi
-            done
-        fi ;;
-    push)
-        s=$2; msg=$3; [ -z "$s" ] || [ -z "$msg" ] && exit 1
-        cloud_info=$(get_cloud_info "$s"); cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
-        LOCK_DIR="$MASTER_REPO/$cloud_path/.lock"
-        mkdir "$LOCK_DIR" 2>/dev/null || (echo "🚨 Locked" && exit 1)
-        trap 'rm -rf "$LOCK_DIR"' EXIT
-        old_ver=$(echo "$cloud_info" | jq -r ".version"); new_ver=$(echo "$old_ver" | awk "{print \$1 + 0.1}"); now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-        mkdir -p "$MASTER_REPO/snapshots"
-        tar -czf "$MASTER_REPO/snapshots/${s}_v${old_ver}.tar.gz" -C "$MASTER_REPO" "$cloud_path" 2>/dev/null
-        rsync -av "$LOCAL_REPO/$s/" "$MASTER_REPO/$cloud_path/"
-        tmp_m=$(mktemp); jq ".version = \"$new_ver\" | .description = \"$msg\" | .last_updated = \"$now\" | .history = ([\"[$now] v$new_ver - $msg\"] + .history | .[0:10])" "$MASTER_REPO/$cloud_path/manifest.json" > "$tmp_m" && mv "$tmp_m" "$MASTER_REPO/$cloud_path/manifest.json"
-        echo "[$now] v$new_ver - $msg" >> "$MASTER_REPO/$cloud_path/COMMIT_HISTORY.md"
-        echo "✅ Push Complete." ;;
-    status)
-        fetch_master > /dev/null
-        # ... version comparison logic ...
-        ;;
-    *) echo "Lattice JVC v3.3 (Ecosystem Edition)"; exit 1 ;;
+    status) fetch_master > /dev/null; echo "--- JVC 同步狀態 ---";
+        for t in $SYNC_TARGETS; do
+            if [[ "$t" == cat:* ]]; then
+                cat_name=${t#cat:}; cache="$LOCAL_REPO/skill-sync-manager/cloud_map_cache.json"
+                SKILLS=$(jq -r ".skills | to_entries | .[] | select(.value.category == \"$cat_name\") | .key" "$cache")
+                for s in $SKILLS; do check_skill_status "$s"; done
+            else check_skill_status "$t"; fi
+        done ;;
+    pull) fetch_master > /dev/null; pull_sync ;;
+    push) push_skill "$2" "$3" ;;
+    history) info=$(get_cloud_info "$2"); [ -n "$info" ] && echo "$info" | jq -r '.history[]' || echo "無紀錄" ;;
+    *) usage ;;
 esac
