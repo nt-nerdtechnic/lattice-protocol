@@ -160,6 +160,12 @@ pull_skill_logic() {
     eval "rsync -av --delete $EXCLUDE_ARGS \"$MASTER_REPO/$cloud_path/\" \"$LOCAL_REPO/$s/\""
     
     update_local_version "$s" "$m_ver"
+
+    # [Hook] Post-Pull
+    if [ -f "$LOCAL_REPO/$s/scripts/post_pull.sh" ]; then
+        echo "🪝  執行 Post-Pull Hook..."
+        bash "$LOCAL_REPO/$s/scripts/post_pull.sh"
+    fi
 }
 
 pull_sync() {
@@ -178,16 +184,37 @@ pull_sync() {
 push_skill() {
     local s=$1; local msg=$2; [ -z "$s" ] || [ -z "$msg" ] && echo "用法: push <skill> <msg>" && exit 1
     local cloud_info=$(get_cloud_info "$s")
+    
+    # [Hook] Pre-Push
+    if [ -f "$LOCAL_REPO/$s/scripts/pre_push.sh" ]; then
+        echo "🪝  執行 Pre-Push Hook..."
+        bash "$LOCAL_REPO/$s/scripts/pre_push.sh" || { echo "❌ Pre-Push Hook 失敗，中止推送。"; exit 1; }
+    fi
     [ -z "$cloud_info" ] && echo "❌ 錯誤：JVC 找不到此技能" && exit 1
     local cloud_path=$(echo "$cloud_info" | jq -r ".cloud_path")
     local LOCK_DIR="$MASTER_REPO/$cloud_path/.lock"
     
     echo "🔒 獲取 JVC [$s] 鎖..."
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        local lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
-        echo "🚨 [LOCK_CONFLICT] 鎖定失敗：該節點正被佔用 (鎖定時間: ${lock_age}s)。"
-        echo "💡 [USER_ACTION_REQUIRED] 建議執行: rm -rf \"$LOCK_DIR\""
-        exit 42
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then 
+        # Soft Unlock Check
+        if [ -d "$LOCK_DIR" ]; then
+            now_ts=$(date +%s)
+            # macOS compatible stat
+            lock_ts=$(stat -f %m "$LOCK_DIR")
+            age=$((now_ts - lock_ts))
+            if [ "$age" -gt 600 ]; then
+                echo "⚠️ 偵測到過期鎖定 (${age}s > 600s)，執行軟解鎖 (Soft Unlock)..."
+                rm -rf "$LOCK_DIR"
+                # Retry lock
+                if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+                    echo "🚨 軟解鎖後鎖定仍失敗，請手動檢查。" && exit 1
+                fi
+            else
+                echo "🚨 鎖定失敗：該節點正被佔用 (鎖定時間: ${age}s)。" && exit 1
+            fi
+        else
+            echo "🚨 鎖定失敗：未知的鎖定狀態。" && exit 1
+        fi
     fi
     
     trap 'rm -rf "$LOCK_DIR"' EXIT

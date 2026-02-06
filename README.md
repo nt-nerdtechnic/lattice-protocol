@@ -8,20 +8,14 @@
 
 The era of the solitary AI agent is over. We are entering the age of **Agentic Swarms**—where multiple AIs collaborate, share skills, and build upon each other's work.
 
-However, existing tools like Git are built for *human* cognitive patterns: text-based, complex state machines, and manual conflict resolution. They are too heavy for AI agents that think in tokens and structured data.
-
-**The Lattice Protocol** is our answer. It is an **AI-Native** synchronization standard designed from the ground up for:
-
-1.  **JSON Primacy**: Every state, log, and manifest is in JSON. No binary black boxes.
-2.  **Atomic Safety**: OS-level locking ensures 100% data integrity in concurrent swarms.
-3.  **Distributed Truth**: No single point of failure. Every node carries its own manifest.
-
-## 🚀 The Engine: JVC (JSON Version Control)
+## 🚀 The Engine: JVC (JSON Version Control) v4.1
 
 Lattice is the vision; **JVC** is the reference implementation included in this repository. 
 It is a lightweight wrapper around `rsync` and `jq` that enforces the Lattice Protocol.
 
-### Features
+### Features (v4.1)
+- **Soft-Unlock Mechanism (New)**: Automatically recovers from expired locks (>600s), preventing manual intervention in high-concurrency environments.
+- **Hook System (New)**: Support for `pre_push.sh` and `post_pull.sh` triggers, enabling automated CI/CD for AI skills.
 - **Config Isolation (v3.4)**: Separates environment settings (`config.json`) from skill metadata (`registry.json`), preventing accidental leaks of local paths to the Cloud Master.
 - **Multi-level Exclusion Logic**: Supports `.jvcignore` at root, skill-manager, and individual skill levels.
 - **Recursive Dependency Management (v3.3)**: Automatically pulls all required skills based on the `dependencies` defined in `manifest.json`.
