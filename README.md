@@ -22,6 +22,7 @@ Lattice is the vision; **JVC** is the reference implementation included in this 
 It is a lightweight wrapper around `rsync` and `jq` that enforces the Lattice Protocol.
 
 ### Features
+- **Recursive Dependency Management (v3.3)**: Automatically pulls all required skills based on the `dependencies` defined in `manifest.json`.
 - **Atomic Push**: Uses `mkdir` mutex locks to prevent race conditions.
 - **Snapshot Rollback**: Automatically backs up previous versions before any destructive change.
 - **Cognitive Optimization**: Excludes heavy history log files (`COMMIT_HISTORY.md`) from local agent workspaces to save context window.
